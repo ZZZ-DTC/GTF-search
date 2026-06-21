@@ -147,7 +147,11 @@ claude mcp add-json grok-search --scope user '{
 | `GUDA_BASE_URL` | ❌ | `https://code.guda.studio` | GuDa 服务基础地址 |
 | `GROK_API_URL` | ❌ | `{GUDA_BASE_URL}/grok/v1` | Grok API 地址（OpenAI 兼容格式），显式设置时覆盖 GuDa 派生值 |
 | `GROK_API_KEY` | ❌ | `{GUDA_API_KEY}` | Grok API 密钥，显式设置时覆盖 GuDa 派生值 |
-| `GROK_MODEL` | ❌ | `grok-4.20-beta` | 默认模型（设置后优先于 `~/.config/grok-search/config.json`） |
+| `GROK_API_ENDPOINT` | ❌ | `chat/completions` | Grok 请求端点。可设为 `chat/completions` 或 `responses` |
+| `GROK_MODEL` | ❌ | `grok-4.20-fast` | 默认模型（设置后优先于 `~/.config/grok-search/config.json`） |
+| `GROK_MODEL_FAST` | ❌ | `{GROK_MODEL}` | `web_search search_mode=fast` 使用的模型 |
+| `GROK_MODEL_DEEP` | ❌ | `{GROK_MODEL}` | `web_search search_mode=deep` 使用的模型 |
+| `GROK_SEARCH_MODE` | ❌ | `fast` | 默认搜索模式。可设为 `fast`、`deep` 或 `auto` |
 | `TAVILY_API_KEY` | ❌ | `{GUDA_API_KEY}` | Tavily API 密钥（用于 web_fetch / web_map） |
 | `TAVILY_API_URL` | ❌ | `{GUDA_BASE_URL}/tavily` | Tavily API 地址 |
 | `TAVILY_ENABLED` | ❌ | `true` | 是否启用 Tavily |
@@ -180,7 +184,7 @@ claude mcp list
 ## 三、MCP 工具介绍
 
 <details>
-<summary>本项目提供八个 MCP 工具（展开查看）</summary>
+<summary>本项目提供的主要 MCP 工具（展开查看）</summary>
 
 ### `web_search` — AI 网络搜索
 
@@ -193,7 +197,8 @@ claude mcp list
 | `query` | string | ✅ | - | 搜索查询语句 |
 | `platform` | string | ❌ | `""` | 聚焦平台（如 `"Twitter"`, `"GitHub, Reddit"`） |
 | `model` | string | ❌ | `null` | 按次指定 Grok 模型 ID |
-| `extra_sources` | int | ❌ | `0` | 额外补充信源数量（Tavily/Firecrawl，可为 0 关闭） |
+| `search_mode` | string | ❌ | `""` | Grok 模型路由模式。空值使用 `GROK_SEARCH_MODE`；支持 `fast`、`deep`、`auto` |
+| `extra_sources` | int | ❌ | `1` | 额外补充信源数量（Tavily/Firecrawl，可为 0 关闭） |
 
 自动检测查询中的时间相关关键词（如"最新""今天""recent"等），注入本地时间上下文以提升时效性搜索的准确度。
 
@@ -201,6 +206,11 @@ claude mcp list
 - `session_id`: 本次查询的会话 ID
 - `content`: Grok 回答正文（已自动剥离信源）
 - `sources_count`: 已缓存的信源数量
+- `warnings`: 当 Grok 返回为空或不可用时给出诊断提示
+- `model_used`: 本次 Grok 搜索实际使用的模型
+- `search_mode_effective`: 本次实际生效的搜索模式
+
+当 Grok 主搜索返回为空但 Tavily/Firecrawl 仍提供补充信源时，`content` 会以“注意：Grok 主搜索返回为空……”开头，并建议运行 `diagnose_grok_config` 检查 `GROK_API_URL`、`GROK_API_ENDPOINT` 与模型配置。
 
 ### `get_sources` — 获取信源
 
@@ -239,6 +249,14 @@ claude mcp list
 ### `get_config_info` — 配置诊断
 
 无需参数。显示所有配置状态、测试 Grok API 连接、返回响应时间和可用模型列表（API Key 自动脱敏）。
+
+### `diagnose_grok_config` — Grok 连接诊断
+
+用于更深入排查 Grok 主搜索为空、endpoint 不兼容、模型不存在或 URL 缺少 `/v1` 的情况。该工具会测试 `/models`、`chat/completions` 和 `responses`，并返回推荐的 `GROK_API_URL` / `GROK_API_ENDPOINT` 设置。API Key 会自动脱敏。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `model` | string | ❌ | `""` | 按次指定用于探测的模型；空值使用 fast/default 模型 |
 
 ### `switch_model` — 模型切换
 

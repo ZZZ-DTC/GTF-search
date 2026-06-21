@@ -110,6 +110,54 @@ def _backend_status(provider: str, requested: int, ok: bool, count: int = 0, err
     return status
 
 
+_DEEP_SEARCH_KEYWORDS = (
+    "对比", "比较", "评估", "风险", "方案", "选型", "交叉验证", "深度", "研究", "政策",
+    "compare", "comparison", "evaluate", "risk", "strategy", "research", "deep", "policy",
+)
+
+
+def _normalize_search_mode(value: str) -> str:
+    mode = (value or config.default_search_mode or "fast").strip().lower()
+    if mode in ("fast", "deep", "auto"):
+        return mode
+    return "fast"
+
+
+def _select_search_mode(requested_mode: str, query: str, extra_sources: int) -> str:
+    if requested_mode in ("fast", "deep"):
+        return requested_mode
+    query_lower = query.lower()
+    if extra_sources >= 5:
+        return "deep"
+    if any(keyword in query or keyword in query_lower for keyword in _DEEP_SEARCH_KEYWORDS):
+        return "deep"
+    return "fast"
+
+
+def _grok_warning_from_status(status: dict) -> dict | None:
+    if status.get("provider") != "grok" or status.get("ok"):
+        return None
+    error = status.get("error") or "empty_result"
+    return {
+        "code": "grok_empty_result",
+        "message": (
+            "Grok 主搜索返回为空或不可用，当前回答可能主要依赖 Tavily/Firecrawl 补充信源。"
+            "建议运行 diagnose_grok_config 检查 GROK_API_URL、GROK_API_ENDPOINT、GROK_MODEL。"
+        ),
+        "provider": "grok",
+        "error": error,
+    }
+
+
+def _prepend_warning(content: str, warning: dict | None) -> str:
+    if not warning:
+        return content
+    notice = f"注意：{warning['message']}"
+    if not content:
+        return notice
+    return f"{notice}\n\n{content}"
+
+
 def _fallback_answer(extra_sources: list[dict], statuses: list[dict]) -> str:
     failures = [s for s in statuses if not s.get("ok") and (s.get("requested", 0) > 0 or s.get("provider") == "grok")]
     if extra_sources:
@@ -192,6 +240,7 @@ async def web_search(
     query: Annotated[str, "Clear, self-contained natural-language search query."],
     platform: Annotated[str, "Target platform to focus on (e.g., 'Twitter', 'GitHub', 'Reddit'). Leave empty for general web search."] = "",
     model: Annotated[str, "Optional model ID for this request only. This value is used ONLY when user explicitly provided."] = "",
+    search_mode: Annotated[str, "Grok search mode: fast, deep, or auto. Empty uses GROK_SEARCH_MODE, default fast."] = "",
     extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl. Set 0 to disable. Default 1. Values above GROK_SEARCH_MAX_EXTRA_SOURCES are capped."] = 1,
 ) -> dict:
     session_id = new_session_id()
@@ -202,18 +251,22 @@ async def web_search(
         await _SOURCES_CACHE.set(session_id, [])
         return {"session_id": session_id, "content": f"配置错误: {str(e)}", "sources_count": 0}
 
-    effective_model = config.grok_model
+    effective_extra_sources = _normalize_extra_sources(extra_sources)
+    requested_search_mode = _normalize_search_mode(search_mode)
+    effective_search_mode = _select_search_mode(requested_search_mode, query, effective_extra_sources)
+    effective_model = config.grok_model_for_mode(effective_search_mode)
+    model_source = f"search_mode:{effective_search_mode}"
     if model:
         available = await _get_available_models_cached(api_url, api_key)
         if available and model not in available:
             await _SOURCES_CACHE.set(session_id, [])
             return {"session_id": session_id, "content": f"无效模型: {model}", "sources_count": 0}
         effective_model = model
+        model_source = "explicit_model"
 
     grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
 
     # 计算额外信源配额：默认低成本启用 Tavily；3 条以上才让 Firecrawl 参与托底。
-    effective_extra_sources = _normalize_extra_sources(extra_sources)
     has_tavily = bool(config.tavily_api_key) and config.tavily_enabled
     has_firecrawl = bool(config.firecrawl_api_key)
     tavily_count, firecrawl_count = _split_extra_source_counts(effective_extra_sources, has_tavily, has_firecrawl)
@@ -266,15 +319,25 @@ async def web_search(
     answer, grok_sources = split_answer_and_sources(grok_result or "")
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
     all_sources = merge_sources(grok_sources, extra)
+    warnings = []
+    grok_warning = _grok_warning_from_status(grok_status)
+    if grok_warning:
+        warnings.append(grok_warning)
 
     if not answer:
         answer = _fallback_answer(extra, backend_status)
+    answer = _prepend_warning(answer, grok_warning)
 
     await _SOURCES_CACHE.set(session_id, all_sources)
     return {
         "session_id": session_id,
         "content": answer,
         "sources_count": len(all_sources),
+        "warnings": warnings,
+        "model_used": effective_model,
+        "model_source": model_source,
+        "search_mode_requested": requested_search_mode,
+        "search_mode_effective": effective_search_mode,
         "extra_sources_requested": extra_sources,
         "extra_sources_effective": effective_extra_sources,
         "tavily_count": tavily_count,
@@ -508,6 +571,226 @@ async def web_map(
 ) -> str:
     result = await _call_tavily_map(url, instructions, max_depth, max_breadth, limit, timeout)
     return result
+
+
+def _sanitize_diagnostic_text(value: str, api_key: str) -> str:
+    if not value:
+        return ""
+    return value.replace(api_key, "***")[:500]
+
+
+def _extract_probe_text_and_format(body: str) -> tuple[str, str]:
+    import json
+
+    chunks: list[str] = []
+    detected_format = "unknown"
+
+    def absorb(data: dict, transport: str) -> None:
+        nonlocal detected_format
+        if not isinstance(data, dict):
+            return
+        event_type = data.get("type", "")
+        if event_type == "response.output_text.delta" or ("output_text" in event_type and "delta" in data):
+            chunks.append(data.get("delta", "") or "")
+            detected_format = "responses_sse" if transport == "sse" else "responses_json"
+            return
+        if event_type == "response.completed":
+            text = GrokSearchProvider("", "")._extract_responses_text(data.get("response", {}) or {})
+            if text:
+                chunks.append(text)
+                detected_format = "responses_sse" if transport == "sse" else "responses_json"
+            return
+        choices = data.get("choices", []) or []
+        if choices:
+            first = choices[0] or {}
+            delta = first.get("delta", {}) or {}
+            message = first.get("message", {}) or {}
+            content = delta.get("content") or message.get("content") or first.get("text") or ""
+            if isinstance(content, str) and content:
+                chunks.append(content)
+                detected_format = "chat_sse" if transport == "sse" else "chat_json"
+                return
+        if isinstance(data.get("output_text"), str):
+            chunks.append(data["output_text"])
+            detected_format = "responses_sse" if transport == "sse" else "responses_json"
+            return
+        if "output" in data:
+            text = GrokSearchProvider("", "")._extract_responses_text(data)
+            if text:
+                chunks.append(text)
+                detected_format = "responses_sse" if transport == "sse" else "responses_json"
+
+    stripped = body.strip()
+    for line in stripped.splitlines():
+        raw = line.strip()
+        if not raw.startswith("data:"):
+            continue
+        raw = raw[5:].strip()
+        if not raw or raw == "[DONE]":
+            continue
+        try:
+            absorb(json.loads(raw), "sse")
+        except json.JSONDecodeError:
+            continue
+
+    if chunks:
+        return "".join(chunks).strip(), detected_format
+
+    if stripped.startswith("{"):
+        try:
+            absorb(json.loads(stripped), "json")
+        except json.JSONDecodeError:
+            pass
+
+    return "".join(chunks).strip(), detected_format
+
+
+async def _probe_grok_endpoint(api_url: str, api_key: str, model: str, endpoint: str) -> dict:
+    import httpx
+    import time
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if endpoint == "responses":
+        body = {
+            "model": model,
+            "input": "用一句中文回复：测试成功",
+            "stream": True,
+            "reasoning": {"effort": config.responses_reasoning_effort},
+        }
+    else:
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": "用一句中文回复：测试成功"}],
+            "stream": True,
+            "max_tokens": 64,
+        }
+
+    start = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+            response = await client.post(f"{api_url.rstrip('/')}/{endpoint}", headers=headers, json=body)
+        elapsed_ms = round((time.time() - start) * 1000, 2)
+        text, response_format = _extract_probe_text_and_format(response.text)
+        result = {
+            "endpoint": endpoint,
+            "status_code": response.status_code,
+            "ok": response.status_code < 400 and bool(text),
+            "response_time_ms": elapsed_ms,
+            "response_format": response_format,
+            "sample": text[:80],
+        }
+        if not result["ok"]:
+            result["error"] = _sanitize_diagnostic_text(response.text, api_key)
+        return result
+    except Exception as exc:
+        return {
+            "endpoint": endpoint,
+            "status_code": None,
+            "ok": False,
+            "response_time_ms": round((time.time() - start) * 1000, 2),
+            "response_format": "error",
+            "sample": "",
+            "error": _sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}", api_key),
+        }
+
+
+@mcp.tool(
+    name="diagnose_grok_config",
+    output_schema=None,
+    description="""
+    Diagnose Grok API configuration without exposing API keys.
+
+    This tool checks /models, configured fast/deep models, and probes both
+    /chat/completions and /responses with a minimal request. Use it after changing
+    GROK_API_URL, GROK_API_KEY, GROK_API_ENDPOINT, or model settings.
+    """,
+    meta={"version": "1.0.0", "author": "guda.studio"},
+)
+async def diagnose_grok_config(
+    model: Annotated[str, "Optional model ID to probe. Empty uses current fast/default model."] = "",
+) -> str:
+    import json
+    import httpx
+    import time
+    from urllib.parse import urlparse
+
+    try:
+        api_url = config.grok_api_url.rstrip("/")
+        api_key = config.grok_api_key
+    except ValueError as exc:
+        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2)
+
+    probe_model = model or config.grok_model_fast
+    model_candidates = []
+    for candidate in [config.grok_model, config.grok_model_fast, config.grok_model_deep, probe_model]:
+        if candidate and candidate not in model_candidates:
+            model_candidates.append(candidate)
+
+    parsed = urlparse(api_url)
+    path = parsed.path.rstrip("/")
+    url_has_v1 = path.endswith("/v1")
+    recommended_url = api_url if url_has_v1 else f"{api_url}/v1"
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    models_result = {"ok": False, "status_code": None, "response_time_ms": 0, "available_models_count": 0, "matched_models": [], "missing_models": []}
+    available_models: list[str] = []
+    start = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            response = await client.get(f"{api_url}/models", headers=headers)
+        models_result["status_code"] = response.status_code
+        models_result["response_time_ms"] = round((time.time() - start) * 1000, 2)
+        if response.status_code == 200:
+            data = response.json()
+            available_models = [item.get("id") for item in data.get("data", []) if isinstance(item, dict) and item.get("id")]
+            models_result["ok"] = True
+            models_result["available_models_count"] = len(available_models)
+        else:
+            models_result["error"] = _sanitize_diagnostic_text(response.text, api_key)
+    except Exception as exc:
+        models_result["response_time_ms"] = round((time.time() - start) * 1000, 2)
+        models_result["error"] = _sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}", api_key)
+
+    if available_models:
+        models_result["matched_models"] = [m for m in model_candidates if m in available_models]
+        models_result["missing_models"] = [m for m in model_candidates if m not in available_models]
+
+    endpoint_order = []
+    for endpoint in [config.grok_api_endpoint, "chat/completions", "responses"]:
+        if endpoint not in endpoint_order:
+            endpoint_order.append(endpoint)
+    endpoint_results = [await _probe_grok_endpoint(api_url, api_key, probe_model, endpoint) for endpoint in endpoint_order]
+
+    recommendations = []
+    working = [item for item in endpoint_results if item.get("ok")]
+    if not url_has_v1:
+        recommendations.append(f"当前 GROK_API_URL 看起来不含 /v1；如果 /models 或请求失败，优先尝试：{recommended_url}")
+    if working:
+        preferred = "chat/completions" if any(item["endpoint"] == "chat/completions" for item in working) else working[0]["endpoint"]
+        recommendations.append(f"推荐 GROK_API_ENDPOINT={preferred}")
+    else:
+        recommendations.append("两个 endpoint 都没有返回可用文本；请检查 URL、Key、模型权限或服务商兼容性。")
+    if models_result.get("missing_models"):
+        recommendations.append("部分配置模型不在 /models 返回列表中；请确认模型名或账号权限。")
+
+    result = {
+        "ok": bool(working),
+        "api_url": api_url,
+        "api_key": config._mask_api_key(api_key),
+        "url_has_v1_suffix": url_has_v1,
+        "recommended_api_url_if_needed": recommended_url,
+        "configured_endpoint": config.grok_api_endpoint,
+        "configured_models": {
+            "GROK_MODEL": config.grok_model,
+            "GROK_MODEL_FAST": config.grok_model_fast,
+            "GROK_MODEL_DEEP": config.grok_model_deep,
+            "probe_model": probe_model,
+        },
+        "models_endpoint": models_result,
+        "endpoint_probes": endpoint_results,
+        "recommendations": recommendations,
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool(

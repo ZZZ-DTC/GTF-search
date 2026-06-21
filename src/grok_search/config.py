@@ -10,7 +10,7 @@ class Config:
         '"git+https://github.com/GuDaStudio/GrokSearch","grok-search"],'
         '"env":{"GUDA_API_KEY":"your-guda-api-key"}}\''
     )
-    _DEFAULT_MODEL = "grok-4.20-beta"
+    _DEFAULT_MODEL = "grok-4.20-fast"
     _DEFAULT_GUDA_BASE_URL = "https://code.guda.studio"
 
     def __new__(cls):
@@ -177,10 +177,17 @@ class Config:
 
     @property
     def grok_api_endpoint(self) -> str:
-        endpoint = os.getenv("GROK_API_ENDPOINT", "responses").strip().lower()
+        endpoint = os.getenv("GROK_API_ENDPOINT", "chat/completions").strip().lower()
         if endpoint in ("chat", "chat_completions", "chat/completions"):
             return "chat/completions"
         return "responses"
+
+    @property
+    def default_search_mode(self) -> str:
+        mode = os.getenv("GROK_SEARCH_MODE", "fast").strip().lower()
+        if mode in ("fast", "deep", "auto"):
+            return mode
+        return "fast"
 
     @property
     def responses_reasoning_effort(self) -> str:
@@ -198,6 +205,21 @@ class Config:
         )
         self._cached_model = self._apply_model_suffix(model)
         return self._cached_model
+
+    @property
+    def grok_model_fast(self) -> str:
+        model = os.getenv("GROK_MODEL_FAST") or self.grok_model
+        return self._apply_model_suffix(model)
+
+    @property
+    def grok_model_deep(self) -> str:
+        model = os.getenv("GROK_MODEL_DEEP") or self.grok_model
+        return self._apply_model_suffix(model)
+
+    def grok_model_for_mode(self, mode: str) -> str:
+        if mode == "deep":
+            return self.grok_model_deep
+        return self.grok_model_fast
 
     def set_model(self, model: str) -> None:
         config_data = self._load_config_file()
@@ -229,7 +251,11 @@ class Config:
             "GUDA_API_KEY": self._mask_api_key(self.guda_api_key) if self.guda_api_key else "未配置",
             "GROK_API_URL": api_url,
             "GROK_API_KEY": api_key_masked,
+            "GROK_API_ENDPOINT": self.grok_api_endpoint,
             "GROK_MODEL": self.grok_model,
+            "GROK_MODEL_FAST": self.grok_model_fast,
+            "GROK_MODEL_DEEP": self.grok_model_deep,
+            "GROK_SEARCH_MODE": self.default_search_mode,
             "GROK_DEBUG": self.debug_enabled,
             "GROK_LOG_LEVEL": self.log_level,
             "GROK_LOG_DIR": str(self.log_dir),

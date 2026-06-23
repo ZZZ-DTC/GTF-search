@@ -1,23 +1,42 @@
-import os
 import json
+import os
+from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class GrokProviderProfile:
+    name: str
+    api_url: str = ""
+    api_key: str = ""
+    endpoint: str = "chat/completions"
+    model: str = ""
+    enabled: bool = True
+    missing_fields: tuple[str, ...] = ()
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_url or self.api_key or self.model)
+
+    @property
+    def complete(self) -> bool:
+        return self.enabled and not self.missing_fields
+
 
 class Config:
     _instance = None
     _SETUP_COMMAND = (
-        'claude mcp add-json grok-search --scope user '
-        '\'{"type":"stdio","command":"uvx","args":["--from",'
-        '"git+https://github.com/GuDaStudio/GrokSearch","grok-search"],'
-        '"env":{"GUDA_API_KEY":"your-guda-api-key"}}\''
+        "Configure at least one Grok provider profile, e.g. "
+        "GROK_PROVIDER_FAST_API_URL/GROK_PROVIDER_FAST_API_KEY/"
+        "GROK_PROVIDER_FAST_MODEL."
     )
-    _DEFAULT_MODEL = "grok-4.20-fast"
     _DEFAULT_GUDA_BASE_URL = "https://code.guda.studio"
+    _PROFILE_NAMES = ("fast", "deep")
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._config_file = None
-            cls._instance._cached_model = None
         return cls._instance
 
     @property
@@ -36,14 +55,14 @@ class Config:
         if not self.config_file.exists():
             return {}
         try:
-            with open(self.config_file, 'r', encoding='utf-8') as f:
+            with open(self.config_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
             return {}
 
     def _save_config_file(self, config_data: dict) -> None:
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(config_data, f, ensure_ascii=False, indent=2)
         except IOError as e:
             raise ValueError(f"无法保存配置文件: {str(e)}")
@@ -88,28 +107,6 @@ class Config:
     @property
     def guda_api_key(self) -> str | None:
         return os.getenv("GUDA_API_KEY")
-
-    @property
-    def grok_api_url(self) -> str:
-        url = os.getenv("GROK_API_URL")
-        if not url:
-            if self.guda_api_key:
-                return f"{self.guda_base_url}/grok/v1"
-            raise ValueError(
-                f"Grok API URL 未配置！\n"
-                f"请使用以下命令配置 MCP 服务器：\n{self._SETUP_COMMAND}"
-            )
-        return url
-
-    @property
-    def grok_api_key(self) -> str:
-        key = os.getenv("GROK_API_KEY") or self.guda_api_key
-        if not key:
-            raise ValueError(
-                f"Grok API Key 未配置！\n"
-                f"请使用以下命令配置 MCP 服务器：\n{self._SETUP_COMMAND}"
-            )
-        return key
 
     @property
     def tavily_enabled(self) -> bool:
@@ -166,22 +163,6 @@ class Config:
         tmp_log_dir.mkdir(parents=True, exist_ok=True)
         return tmp_log_dir
 
-    def _apply_model_suffix(self, model: str) -> str:
-        try:
-            url = self.grok_api_url
-        except ValueError:
-            return model
-        if "openrouter" in url and ":online" not in model:
-            return f"{model}:online"
-        return model
-
-    @property
-    def grok_api_endpoint(self) -> str:
-        endpoint = os.getenv("GROK_API_ENDPOINT", "chat/completions").strip().lower()
-        if endpoint in ("chat", "chat_completions", "chat/completions"):
-            return "chat/completions"
-        return "responses"
-
     @property
     def default_search_mode(self) -> str:
         mode = os.getenv("GROK_SEARCH_MODE", "fast").strip().lower()
@@ -190,72 +171,112 @@ class Config:
         return "fast"
 
     @property
+    def strict_search_mode(self) -> bool:
+        return os.getenv("GROK_STRICT_SEARCH_MODE", "false").lower() in ("true", "1", "yes")
+
+    @property
     def responses_reasoning_effort(self) -> str:
         return os.getenv("GROK_RESPONSES_REASONING_EFFORT", "none")
 
-    @property
-    def grok_model(self) -> str:
-        if self._cached_model is not None:
-            return self._cached_model
+    def normalize_endpoint(self, endpoint: str | None) -> str:
+        raw = (endpoint or "chat/completions").strip().lower()
+        if raw in ("chat", "chat_completions", "chat/completions"):
+            return "chat/completions"
+        if raw in ("response", "responses", "v1/responses"):
+            return "responses"
+        return raw.strip("/") or "chat/completions"
 
-        model = (
-            os.getenv("GROK_MODEL")
-            or self._load_config_file().get("model")
-            or self._DEFAULT_MODEL
+    def _apply_model_suffix(self, model: str, api_url: str) -> str:
+        if "openrouter" in api_url and ":online" not in model:
+            return f"{model}:online"
+        return model
+
+    def _profile_from_env(self, name: str) -> GrokProviderProfile:
+        prefix = f"GROK_PROVIDER_{name.upper()}_"
+        api_url = os.getenv(f"{prefix}API_URL", "").strip().rstrip("/")
+        api_key = os.getenv(f"{prefix}API_KEY", "")
+        endpoint = self.normalize_endpoint(os.getenv(f"{prefix}ENDPOINT", "chat/completions"))
+        model = os.getenv(f"{prefix}MODEL", "").strip()
+        enabled = os.getenv(f"{prefix}ENABLED", "true").lower() in ("true", "1", "yes")
+
+        missing: list[str] = []
+        if not api_url:
+            missing.append(f"{prefix}API_URL")
+        if not api_key:
+            missing.append(f"{prefix}API_KEY")
+        if not model:
+            missing.append(f"{prefix}MODEL")
+
+        if model and api_url:
+            model = self._apply_model_suffix(model, api_url)
+
+        return GrokProviderProfile(
+            name=name,
+            api_url=api_url,
+            api_key=api_key,
+            endpoint=endpoint,
+            model=model,
+            enabled=enabled,
+            missing_fields=tuple(missing),
         )
-        self._cached_model = self._apply_model_suffix(model)
-        return self._cached_model
 
-    @property
-    def grok_model_fast(self) -> str:
-        model = os.getenv("GROK_MODEL_FAST") or self.grok_model
-        return self._apply_model_suffix(model)
+    def grok_provider_profiles(self, include_incomplete: bool = False) -> list[GrokProviderProfile]:
+        profiles = [self._profile_from_env(name) for name in self._PROFILE_NAMES]
+        if include_incomplete:
+            return [profile for profile in profiles if profile.configured]
+        return [profile for profile in profiles if profile.complete]
 
-    @property
-    def grok_model_deep(self) -> str:
-        model = os.getenv("GROK_MODEL_DEEP") or self.grok_model
-        return self._apply_model_suffix(model)
+    def resolve_grok_provider(self, search_mode: str) -> tuple[GrokProviderProfile, str]:
+        requested = search_mode if search_mode in self._PROFILE_NAMES else self.default_search_mode
+        if requested not in self._PROFILE_NAMES:
+            requested = "fast"
 
-    def grok_model_for_mode(self, mode: str) -> str:
-        if mode == "deep":
-            return self.grok_model_deep
-        return self.grok_model_fast
+        profiles = {profile.name: profile for profile in self.grok_provider_profiles()}
+        if not profiles:
+            raise ValueError(
+                "Grok Provider Profile 未配置。请至少配置一组 "
+                "GROK_PROVIDER_FAST_* 或 GROK_PROVIDER_DEEP_*。"
+            )
 
-    def set_model(self, model: str) -> None:
-        config_data = self._load_config_file()
-        config_data["model"] = model
-        self._save_config_file(config_data)
-        self._cached_model = self._apply_model_suffix(model)
+        if requested in profiles:
+            return profiles[requested], "requested_profile"
+
+        if self.strict_search_mode:
+            raise ValueError(f"Grok provider profile '{requested}' 未配置，且 GROK_STRICT_SEARCH_MODE=true。")
+
+        fallback_name = "fast" if "fast" in profiles else "deep"
+        return profiles[fallback_name], "only_configured_profile"
 
     @staticmethod
-    def _mask_api_key(key: str) -> str:
-        """脱敏显示 API Key，只显示前后各 4 个字符"""
+    def _mask_api_key(key: str | None) -> str:
         if not key or len(key) <= 8:
             return "***"
         return f"{key[:4]}{'*' * (len(key) - 8)}{key[-4:]}"
 
-    def get_config_info(self) -> dict:
-        """获取配置信息（API Key 已脱敏）"""
-        try:
-            api_url = self.grok_api_url
-            api_key_raw = self.grok_api_key
-            api_key_masked = self._mask_api_key(api_key_raw)
-            config_status = "✅ 配置完整"
-        except ValueError as e:
-            api_url = "未配置"
-            api_key_masked = "未配置"
-            config_status = f"❌ 配置错误: {str(e)}"
+    def _profile_info(self, profile: GrokProviderProfile) -> dict:
+        return {
+            "name": profile.name,
+            "configured": profile.configured,
+            "complete": profile.complete,
+            "enabled": profile.enabled,
+            "api_url": profile.api_url or "未配置",
+            "api_key": self._mask_api_key(profile.api_key) if profile.api_key else "未配置",
+            "endpoint": profile.endpoint,
+            "model": profile.model or "未配置",
+            "missing_fields": list(profile.missing_fields),
+        }
 
-        info = {
+    def get_config_info(self) -> dict:
+        profiles = [self._profile_info(profile) for profile in self.grok_provider_profiles(include_incomplete=True)]
+        complete_profiles = [profile for profile in profiles if profile["complete"]]
+        config_status = "✅ 配置完整" if complete_profiles else "❌ Grok Provider Profile 未配置完整"
+
+        return {
             "GUDA_BASE_URL": self.guda_base_url,
             "GUDA_API_KEY": self._mask_api_key(self.guda_api_key) if self.guda_api_key else "未配置",
-            "GROK_API_URL": api_url,
-            "GROK_API_KEY": api_key_masked,
-            "GROK_API_ENDPOINT": self.grok_api_endpoint,
-            "GROK_MODEL": self.grok_model,
-            "GROK_MODEL_FAST": self.grok_model_fast,
-            "GROK_MODEL_DEEP": self.grok_model_deep,
             "GROK_SEARCH_MODE": self.default_search_mode,
+            "GROK_STRICT_SEARCH_MODE": self.strict_search_mode,
+            "GROK_PROVIDER_PROFILES": profiles,
             "GROK_DEBUG": self.debug_enabled,
             "GROK_LOG_LEVEL": self.log_level,
             "GROK_LOG_DIR": str(self.log_dir),
@@ -266,6 +287,6 @@ class Config:
             "FIRECRAWL_API_KEY": self._mask_api_key(self.firecrawl_api_key) if self.firecrawl_api_key else "未配置",
             "config_status": config_status,
         }
-        return info
+
 
 config = Config()

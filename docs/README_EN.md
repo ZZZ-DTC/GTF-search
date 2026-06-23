@@ -109,8 +109,10 @@ claude mcp add-json grok-search --scope user '{
     "grok-search"
   ],
   "env": {
-    "GROK_API_URL": "https://your-api-endpoint.com/v1",
-    "GROK_API_KEY": "your-grok-api-key",
+    "GROK_PROVIDER_FAST_API_URL": "https://your-fast-provider.example/v1",
+    "GROK_PROVIDER_FAST_API_KEY": "your-fast-provider-key",
+    "GROK_PROVIDER_FAST_ENDPOINT": "chat/completions",
+    "GROK_PROVIDER_FAST_MODEL": "grok-4.20-fast",
     "TAVILY_API_KEY": "tvly-your-tavily-key",
     "TAVILY_API_URL": "https://api.tavily.com"
   }
@@ -121,11 +123,18 @@ You can also configure additional environment variables in the `env` field:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GUDA_API_KEY` | No | - | GuDa API key (auto-derives all service URLs and keys when set) |
+| `GUDA_API_KEY` | No | - | GuDa API key for Tavily / Firecrawl derived values when explicit values are not set |
 | `GUDA_BASE_URL` | No | `https://code.guda.studio` | GuDa service base URL |
-| `GROK_API_URL` | No | `{GUDA_BASE_URL}/grok/v1` | Grok API endpoint (OpenAI-compatible), overrides GuDa-derived value |
-| `GROK_API_KEY` | No | `{GUDA_API_KEY}` | Grok API key, overrides GuDa-derived value |
-| `GROK_MODEL` | No | `grok-4.20-beta` | Default model (takes precedence over `~/.config/grok-search/config.json` when set) |
+| `GROK_PROVIDER_FAST_API_URL` | Maybe | - | FAST provider OpenAI-compatible API URL |
+| `GROK_PROVIDER_FAST_API_KEY` | Maybe | - | FAST provider API key |
+| `GROK_PROVIDER_FAST_ENDPOINT` | No | `chat/completions` | FAST provider endpoint: `chat/completions` or `responses` |
+| `GROK_PROVIDER_FAST_MODEL` | Maybe | - | FAST provider model |
+| `GROK_PROVIDER_DEEP_API_URL` | Maybe | - | DEEP provider OpenAI-compatible API URL |
+| `GROK_PROVIDER_DEEP_API_KEY` | Maybe | - | DEEP provider API key |
+| `GROK_PROVIDER_DEEP_ENDPOINT` | No | `chat/completions` | DEEP provider endpoint: `chat/completions` or `responses` |
+| `GROK_PROVIDER_DEEP_MODEL` | Maybe | - | DEEP provider model |
+| `GROK_SEARCH_MODE` | No | `fast` | Default search mode: `fast`, `deep`, or `auto` |
+| `GROK_STRICT_SEARCH_MODE` | No | `false` | Require requested profile to exist instead of falling back |
 | `TAVILY_API_KEY` | No | `{GUDA_API_KEY}` | Tavily API key (for web_fetch / web_map) |
 | `TAVILY_API_URL` | No | `{GUDA_BASE_URL}/tavily` | Tavily API endpoint |
 | `TAVILY_ENABLED` | No | `true` | Enable Tavily |
@@ -138,7 +147,7 @@ You can also configure additional environment variables in the `env` field:
 | `GROK_RETRY_MULTIPLIER` | No | `1` | Retry backoff multiplier |
 | `GROK_RETRY_MAX_WAIT` | No | `10` | Max retry wait in seconds |
 
-> **Note**: When `GUDA_API_KEY` is set, all `GROK_API_URL`/`GROK_API_KEY`/`TAVILY_*`/`FIRECRAWL_*` variables become optional as they are auto-derived from `GUDA_BASE_URL`. Explicitly set variables take higher priority.
+> **Note**: Configure at least one complete `GROK_PROVIDER_FAST_*` or `GROK_PROVIDER_DEEP_*` profile. If only one profile is configured, all search modes can use it without user-visible warnings.
 
 
 ### Verify Installation
@@ -245,7 +254,7 @@ A structured multi-phase planning scaffold to generate an executable search plan
 <summary>
 Q: Must I configure both Grok and Tavily?
 </summary>
-A: Set `GUDA_API_KEY` to get full Grok + Tavily + Firecrawl service. Without GuDa, Grok (`GROK_API_URL` + `GROK_API_KEY`) is required and provides the core search capability. Tavily is optional — without it, `web_fetch` and `web_map` will return configuration error messages.
+A: Configure at least one complete Grok Provider Profile. Tavily is optional; without it, `web_fetch` and `web_map` may return configuration error messages.
 </details>
 
 <details>

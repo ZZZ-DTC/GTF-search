@@ -142,7 +142,7 @@ def _grok_warning_from_status(status: dict) -> dict | None:
         "code": "grok_empty_result",
         "message": (
             "Grok 主搜索返回为空或不可用，当前回答可能主要依赖 Tavily/Firecrawl 补充信源。"
-            "建议运行 diagnose_grok_config 检查 GROK_API_URL、GROK_API_ENDPOINT、GROK_MODEL。"
+            "建议运行 diagnose_grok_config 检查 GROK_PROVIDER_*_API_URL、ENDPOINT、MODEL。"
         ),
         "provider": "grok",
         "error": error,
@@ -239,32 +239,33 @@ def _extra_results_to_sources(
 async def web_search(
     query: Annotated[str, "Clear, self-contained natural-language search query."],
     platform: Annotated[str, "Target platform to focus on (e.g., 'Twitter', 'GitHub', 'Reddit'). Leave empty for general web search."] = "",
-    model: Annotated[str, "Optional model ID for this request only. This value is used ONLY when user explicitly provided."] = "",
     search_mode: Annotated[str, "Grok search mode: fast, deep, or auto. Empty uses GROK_SEARCH_MODE, default fast."] = "",
     extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl. Set 0 to disable. Default 1. Values above GROK_SEARCH_MAX_EXTRA_SOURCES are capped."] = 1,
 ) -> dict:
     session_id = new_session_id()
-    try:
-        api_url = config.grok_api_url
-        api_key = config.grok_api_key
-    except ValueError as e:
-        await _SOURCES_CACHE.set(session_id, [])
-        return {"session_id": session_id, "content": f"配置错误: {str(e)}", "sources_count": 0}
-
     effective_extra_sources = _normalize_extra_sources(extra_sources)
     requested_search_mode = _normalize_search_mode(search_mode)
     effective_search_mode = _select_search_mode(requested_search_mode, query, effective_extra_sources)
-    effective_model = config.grok_model_for_mode(effective_search_mode)
-    model_source = f"search_mode:{effective_search_mode}"
-    if model:
-        available = await _get_available_models_cached(api_url, api_key)
-        if available and model not in available:
-            await _SOURCES_CACHE.set(session_id, [])
-            return {"session_id": session_id, "content": f"无效模型: {model}", "sources_count": 0}
-        effective_model = model
-        model_source = "explicit_model"
+    try:
+        grok_profile, provider_profile_reason = config.resolve_grok_provider(effective_search_mode)
+    except ValueError as e:
+        await _SOURCES_CACHE.set(session_id, [])
+        return {
+            "session_id": session_id,
+            "content": f"配置错误: {str(e)}",
+            "sources_count": 0,
+            "warnings": [{"code": "grok_provider_config_error", "message": str(e), "provider": "grok"}],
+            "provider_profile_requested": effective_search_mode,
+            "provider_profile_used": "",
+            "provider_profile_reason": "config_error",
+        }
 
-    grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
+    grok_provider = GrokSearchProvider(
+        grok_profile.api_url,
+        grok_profile.api_key,
+        grok_profile.model,
+        grok_profile.endpoint,
+    )
 
     # 计算额外信源配额：默认低成本启用 Tavily；3 条以上才让 Firecrawl 参与托底。
     has_tavily = bool(config.tavily_api_key) and config.tavily_enabled
@@ -334,8 +335,11 @@ async def web_search(
         "content": answer,
         "sources_count": len(all_sources),
         "warnings": warnings,
-        "model_used": effective_model,
-        "model_source": model_source,
+        "provider_profile_requested": effective_search_mode,
+        "provider_profile_used": grok_profile.name,
+        "provider_profile_reason": provider_profile_reason,
+        "model_used": grok_profile.model,
+        "endpoint_used": grok_profile.endpoint,
         "search_mode_requested": requested_search_mode,
         "search_mode_effective": effective_search_mode,
         "extra_sources_requested": extra_sources,
@@ -645,8 +649,9 @@ def _extract_probe_text_and_format(body: str) -> tuple[str, str]:
     return "".join(chunks).strip(), detected_format
 
 
-async def _probe_grok_endpoint(api_url: str, api_key: str, model: str, endpoint: str) -> dict:
+async def _probe_grok_endpoint(api_url: str, api_key: str, model: str, endpoint: str, attempt: int = 1) -> dict:
     import httpx
+    import asyncio
     import time
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -681,8 +686,14 @@ async def _probe_grok_endpoint(api_url: str, api_key: str, model: str, endpoint:
         }
         if not result["ok"]:
             result["error"] = _sanitize_diagnostic_text(response.text, api_key)
+        if not result["ok"] and attempt < 2 and response.status_code in (408, 429, 500, 502, 503, 504):
+            await asyncio.sleep(1)
+            return await _probe_grok_endpoint(api_url, api_key, model, endpoint, attempt + 1)
         return result
     except Exception as exc:
+        if attempt < 2:
+            await asyncio.sleep(1)
+            return await _probe_grok_endpoint(api_url, api_key, model, endpoint, attempt + 1)
         return {
             "endpoint": endpoint,
             "status_code": None,
@@ -700,95 +711,118 @@ async def _probe_grok_endpoint(api_url: str, api_key: str, model: str, endpoint:
     description="""
     Diagnose Grok API configuration without exposing API keys.
 
-    This tool checks /models, configured fast/deep models, and probes both
-    /chat/completions and /responses with a minimal request. Use it after changing
-    GROK_API_URL, GROK_API_KEY, GROK_API_ENDPOINT, or model settings.
+    This tool checks each configured provider profile, including /models, the
+    configured model, and chat/responses endpoint probes.
     """,
     meta={"version": "1.0.0", "author": "guda.studio"},
 )
 async def diagnose_grok_config(
-    model: Annotated[str, "Optional model ID to probe. Empty uses current fast/default model."] = "",
+    profile: Annotated[str, "Optional provider profile to diagnose: fast or deep. Empty checks all configured profiles."] = "",
 ) -> str:
     import json
     import httpx
     import time
     from urllib.parse import urlparse
 
-    try:
-        api_url = config.grok_api_url.rstrip("/")
-        api_key = config.grok_api_key
-    except ValueError as exc:
-        return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2)
+    requested_profile = profile.strip().lower()
+    profiles = config.grok_provider_profiles(include_incomplete=True)
+    if requested_profile:
+        profiles = [item for item in profiles if item.name == requested_profile]
 
-    probe_model = model or config.grok_model_fast
-    model_candidates = []
-    for candidate in [config.grok_model, config.grok_model_fast, config.grok_model_deep, probe_model]:
-        if candidate and candidate not in model_candidates:
-            model_candidates.append(candidate)
+    if not profiles:
+        result = {
+            "ok": False,
+            "profiles": [],
+            "recommendations": [
+                "未发现 Grok Provider Profile。请至少配置 GROK_PROVIDER_FAST_* 或 GROK_PROVIDER_DEEP_*。"
+            ],
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
-    parsed = urlparse(api_url)
-    path = parsed.path.rstrip("/")
-    url_has_v1 = path.endswith("/v1")
-    recommended_url = api_url if url_has_v1 else f"{api_url}/v1"
+    async def _diagnose_profile(item) -> dict:
+        profile_result = {
+            "name": item.name,
+            "configured": item.configured,
+            "complete": item.complete,
+            "enabled": item.enabled,
+            "api_url": item.api_url or "未配置",
+            "api_key": config._mask_api_key(item.api_key) if item.api_key else "未配置",
+            "endpoint": item.endpoint,
+            "model": item.model or "未配置",
+            "missing_fields": list(item.missing_fields),
+            "models_endpoint": None,
+            "endpoint_probes": [],
+            "recommendations": [],
+        }
+        if not item.complete:
+            profile_result["ok"] = False
+            profile_result["recommendations"].append("该 profile 未配置完整，已跳过网络探测。")
+            return profile_result
 
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    models_result = {"ok": False, "status_code": None, "response_time_ms": 0, "available_models_count": 0, "matched_models": [], "missing_models": []}
-    available_models: list[str] = []
-    start = time.time()
-    try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-            response = await client.get(f"{api_url}/models", headers=headers)
-        models_result["status_code"] = response.status_code
-        models_result["response_time_ms"] = round((time.time() - start) * 1000, 2)
-        if response.status_code == 200:
-            data = response.json()
-            available_models = [item.get("id") for item in data.get("data", []) if isinstance(item, dict) and item.get("id")]
-            models_result["ok"] = True
-            models_result["available_models_count"] = len(available_models)
+        parsed = urlparse(item.api_url)
+        url_has_v1 = parsed.path.rstrip("/").endswith("/v1")
+        recommended_url = item.api_url if url_has_v1 else f"{item.api_url}/v1"
+        profile_result["url_has_v1_suffix"] = url_has_v1
+        profile_result["recommended_api_url_if_needed"] = recommended_url
+
+        headers = {"Authorization": f"Bearer {item.api_key}", "Content-Type": "application/json"}
+        models_result = {
+            "ok": False,
+            "status_code": None,
+            "response_time_ms": 0,
+            "available_models_count": 0,
+            "model_matched": False,
+        }
+        available_models: list[str] = []
+        start = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                response = await client.get(f"{item.api_url}/models", headers=headers)
+            models_result["status_code"] = response.status_code
+            models_result["response_time_ms"] = round((time.time() - start) * 1000, 2)
+            if response.status_code == 200:
+                data = response.json()
+                available_models = [model.get("id") for model in data.get("data", []) if isinstance(model, dict) and model.get("id")]
+                models_result["ok"] = True
+                models_result["available_models_count"] = len(available_models)
+            else:
+                models_result["error"] = _sanitize_diagnostic_text(response.text, item.api_key)
+        except Exception as exc:
+            models_result["response_time_ms"] = round((time.time() - start) * 1000, 2)
+            models_result["error"] = _sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}", item.api_key)
+
+        if available_models:
+            models_result["model_matched"] = item.model in available_models
+            if not models_result["model_matched"]:
+                profile_result["recommendations"].append("配置的模型不在 /models 返回列表中；请确认模型名或账号权限。")
+        profile_result["models_endpoint"] = models_result
+
+        endpoint_order = []
+        for endpoint in [item.endpoint, "chat/completions", "responses"]:
+            if endpoint not in endpoint_order:
+                endpoint_order.append(endpoint)
+        profile_result["endpoint_probes"] = [
+            await _probe_grok_endpoint(item.api_url, item.api_key, item.model, endpoint)
+            for endpoint in endpoint_order
+        ]
+
+        working = [probe for probe in profile_result["endpoint_probes"] if probe.get("ok")]
+        if not url_has_v1:
+            profile_result["recommendations"].append(f"当前 API URL 看起来不含 /v1；如果请求失败，优先尝试：{recommended_url}")
+        if working:
+            preferred = "chat/completions" if any(probe["endpoint"] == "chat/completions" for probe in working) else working[0]["endpoint"]
+            if preferred != item.endpoint:
+                profile_result["recommendations"].append(f"推荐将该 profile endpoint 改为 {preferred}")
         else:
-            models_result["error"] = _sanitize_diagnostic_text(response.text, api_key)
-    except Exception as exc:
-        models_result["response_time_ms"] = round((time.time() - start) * 1000, 2)
-        models_result["error"] = _sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}", api_key)
+            profile_result["recommendations"].append("没有 endpoint 返回可用文本；请检查 URL、Key、模型权限或服务商兼容性。")
+        profile_result["ok"] = bool(working)
+        return profile_result
 
-    if available_models:
-        models_result["matched_models"] = [m for m in model_candidates if m in available_models]
-        models_result["missing_models"] = [m for m in model_candidates if m not in available_models]
-
-    endpoint_order = []
-    for endpoint in [config.grok_api_endpoint, "chat/completions", "responses"]:
-        if endpoint not in endpoint_order:
-            endpoint_order.append(endpoint)
-    endpoint_results = [await _probe_grok_endpoint(api_url, api_key, probe_model, endpoint) for endpoint in endpoint_order]
-
-    recommendations = []
-    working = [item for item in endpoint_results if item.get("ok")]
-    if not url_has_v1:
-        recommendations.append(f"当前 GROK_API_URL 看起来不含 /v1；如果 /models 或请求失败，优先尝试：{recommended_url}")
-    if working:
-        preferred = "chat/completions" if any(item["endpoint"] == "chat/completions" for item in working) else working[0]["endpoint"]
-        recommendations.append(f"推荐 GROK_API_ENDPOINT={preferred}")
-    else:
-        recommendations.append("两个 endpoint 都没有返回可用文本；请检查 URL、Key、模型权限或服务商兼容性。")
-    if models_result.get("missing_models"):
-        recommendations.append("部分配置模型不在 /models 返回列表中；请确认模型名或账号权限。")
-
+    diagnosed_profiles = [await _diagnose_profile(item) for item in profiles]
     result = {
-        "ok": bool(working),
-        "api_url": api_url,
-        "api_key": config._mask_api_key(api_key),
-        "url_has_v1_suffix": url_has_v1,
-        "recommended_api_url_if_needed": recommended_url,
-        "configured_endpoint": config.grok_api_endpoint,
-        "configured_models": {
-            "GROK_MODEL": config.grok_model,
-            "GROK_MODEL_FAST": config.grok_model_fast,
-            "GROK_MODEL_DEEP": config.grok_model_deep,
-            "probe_model": probe_model,
-        },
-        "models_endpoint": models_result,
-        "endpoint_probes": endpoint_results,
-        "recommendations": recommendations,
+        "ok": any(item.get("ok") for item in diagnosed_profiles),
+        "profiles": diagnosed_profiles,
+        "strict_search_mode": config.strict_search_mode,
     }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -797,150 +831,44 @@ async def diagnose_grok_config(
     name="get_config_info",
     output_schema=None,
     description="""
-    Returns current Grok Search MCP server configuration and tests API connectivity.
+    Returns current Grok Search MCP server configuration without making network requests.
 
     **Key Features:**
-        - **Configuration Check:** Verifies environment variables and current settings.
-        - **Connection Test:** Sends request to /models endpoint to validate API access.
-        - **Model Discovery:** Lists all available models from the API.
+        - **Configuration Check:** Shows Provider Profile completeness and current settings.
+        - **Secret Safety:** API keys are automatically masked.
 
     **Edge Cases & Best Practices:**
-        - Use this tool first when debugging connection or configuration issues.
-        - API keys are automatically masked for security in the response.
-        - Connection test timeout is 10 seconds; network issues may cause delays.
+        - Use diagnose_grok_config for live API connectivity tests.
+        - Use this tool first when checking whether env vars were loaded.
     """,
     meta={"version": "1.3.0", "author": "guda.studio"},
 )
 async def get_config_info() -> str:
     import json
-    import httpx
-
-    config_info = config.get_config_info()
-
-    # 添加连接测试
-    test_result = {
-        "status": "未测试",
-        "message": "",
-        "response_time_ms": 0
-    }
-
-    try:
-        api_url = config.grok_api_url
-        api_key = config.grok_api_key
-
-        # 构建 /models 端点 URL
-        models_url = f"{api_url.rstrip('/')}/models"
-
-        # 发送测试请求
-        import time
-        start_time = time.time()
-
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                models_url,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                }
-            )
-
-            response_time = (time.time() - start_time) * 1000  # 转换为毫秒
-
-            if response.status_code == 200:
-                test_result["status"] = "✅ 连接成功"
-                test_result["message"] = f"成功获取模型列表 (HTTP {response.status_code})"
-                test_result["response_time_ms"] = round(response_time, 2)
-
-                # 尝试解析返回的模型列表
-                try:
-                    models_data = response.json()
-                    if "data" in models_data and isinstance(models_data["data"], list):
-                        model_count = len(models_data["data"])
-                        test_result["message"] += f"，共 {model_count} 个模型"
-
-                        # 提取所有模型的 ID/名称
-                        model_names = []
-                        for model in models_data["data"]:
-                            if isinstance(model, dict) and "id" in model:
-                                model_names.append(model["id"])
-
-                        if model_names:
-                            test_result["available_models"] = model_names
-                except:
-                    pass
-            else:
-                test_result["status"] = "⚠️ 连接异常"
-                test_result["message"] = f"HTTP {response.status_code}: {response.text[:100]}"
-                test_result["response_time_ms"] = round(response_time, 2)
-
-    except httpx.TimeoutException:
-        test_result["status"] = "❌ 连接超时"
-        test_result["message"] = "请求超时（10秒），请检查网络连接或 API URL"
-    except httpx.RequestError as e:
-        test_result["status"] = "❌ 连接失败"
-        test_result["message"] = f"网络错误: {str(e)}"
-    except ValueError as e:
-        test_result["status"] = "❌ 配置错误"
-        test_result["message"] = str(e)
-    except Exception as e:
-        test_result["status"] = "❌ 测试失败"
-        test_result["message"] = f"未知错误: {str(e)}"
-
-    config_info["connection_test"] = test_result
-
-    return json.dumps(config_info, ensure_ascii=False, indent=2)
+    return json.dumps(config.get_config_info(), ensure_ascii=False, indent=2)
 
 
 @mcp.tool(
     name="switch_model",
     output_schema=None,
     description="""
-    Switches the default Grok model used for search and fetch operations, persisting the setting.
-
-    **Key Features:**
-        - **Model Selection:** Change the AI model for web search and content fetching.
-        - **Persistent Storage:** Model preference saved to ~/.config/grok-search/config.json.
-        - **Immediate Effect:** New model used for all subsequent operations.
-
-    **Edge Cases & Best Practices:**
-        - Use get_config_info to verify available models before switching.
-        - Invalid model IDs may cause API errors in subsequent requests.
-        - Model changes persist across sessions until explicitly changed again.
+    Deprecated. Grok models are now bound to provider profiles. Update
+    GROK_PROVIDER_FAST_MODEL or GROK_PROVIDER_DEEP_MODEL in your MCP config instead.
     """,
-    meta={"version": "1.3.0", "author": "guda.studio"},
+    meta={"version": "2.0.0", "author": "guda.studio"},
 )
 async def switch_model(
-    model: Annotated[str, "Model ID to switch to (e.g., 'grok-4-fast', 'grok-2-latest', 'grok-vision-beta')."]
+    model: Annotated[str, "Deprecated. Ignored; configure provider profile model env vars instead."]
 ) -> str:
     import json
-
-    try:
-        previous_model = config.grok_model
-        config.set_model(model)
-        current_model = config.grok_model
-
-        result = {
-            "status": "✅ 成功",
-            "previous_model": previous_model,
-            "current_model": current_model,
-            "message": f"模型已从 {previous_model} 切换到 {current_model}",
-            "config_file": str(config.config_file)
-        }
-
-        return json.dumps(result, ensure_ascii=False, indent=2)
-
-    except ValueError as e:
-        result = {
-            "status": "❌ 失败",
-            "message": f"切换模型失败: {str(e)}"
-        }
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except Exception as e:
-        result = {
-            "status": "❌ 失败",
-            "message": f"未知错误: {str(e)}"
-        }
-        return json.dumps(result, ensure_ascii=False, indent=2)
+    return json.dumps({
+        "status": "deprecated",
+        "message": (
+            "switch_model 已废弃。Grok 模型现在绑定到 Provider Profile；"
+            "请修改 GROK_PROVIDER_FAST_MODEL 或 GROK_PROVIDER_DEEP_MODEL。"
+        ),
+        "ignored_model": model,
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool(

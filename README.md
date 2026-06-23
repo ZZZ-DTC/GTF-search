@@ -74,9 +74,9 @@ claude mcp remove grok-search
 
 将以下命令中的环境变量替换为你自己的值后执行。Grok 接口需为 OpenAI 兼容格式；Tavily 为可选配置，未配置时工具 `web_fetch` 和 `web_map` 不可用。
 
-#### GuDa 用户（推荐）
+#### 基础配置（至少一个 Grok Provider Profile）
 
-GuDa 用户只需配置 `GUDA_API_KEY` 即可享受完整服务，所有 API 地址自动派生：
+至少配置一组完整的 Grok Provider Profile。下面示例只配置 FAST，也可以正常运行所有搜索模式：
 
 ```bash
 claude mcp add-json grok-search --scope user '{
@@ -88,7 +88,10 @@ claude mcp add-json grok-search --scope user '{
     "grok-search"
   ],
   "env": {
-    "GUDA_API_KEY": "your-guda-api-key"
+    "GROK_PROVIDER_FAST_API_URL": "https://your-fast-provider.example/v1",
+    "GROK_PROVIDER_FAST_API_KEY": "your-fast-provider-key",
+    "GROK_PROVIDER_FAST_ENDPOINT": "chat/completions",
+    "GROK_PROVIDER_FAST_MODEL": "grok-4.20-fast"
   }
 }'
 ```
@@ -107,12 +110,36 @@ claude mcp add-json grok-search --scope user '{
     "grok-search"
   ],
   "env": {
-    "GROK_API_URL": "https://your-api-endpoint.com/v1",
-    "GROK_API_KEY": "your-grok-api-key",
+    "GROK_PROVIDER_FAST_API_URL": "https://your-fast-provider.example/v1",
+    "GROK_PROVIDER_FAST_API_KEY": "your-fast-provider-key",
+    "GROK_PROVIDER_FAST_ENDPOINT": "chat/completions",
+    "GROK_PROVIDER_FAST_MODEL": "grok-4.20-fast",
     "TAVILY_API_KEY": "tvly-your-tavily-key",
     "TAVILY_API_URL": "https://api.tavily.com"
   }
 }'
+```
+
+Provider Profile 配置模板（示例中的注释建议放在 README / 文档中，真实 `~/.codex/config.toml` 保持干净即可）：
+
+```toml
+# 快速搜索入口：适合日常搜索和低延迟任务
+GROK_PROVIDER_FAST_API_URL = "https://your-fast-provider.example/v1"
+GROK_PROVIDER_FAST_API_KEY = "sk-your-fast-key"
+GROK_PROVIDER_FAST_ENDPOINT = "chat/completions"
+GROK_PROVIDER_FAST_MODEL = "grok-4.20-fast"
+
+# 深度搜索入口：适合复杂研究；可使用另一个服务商
+GROK_PROVIDER_DEEP_API_URL = "https://your-deep-provider.example/v1"
+GROK_PROVIDER_DEEP_API_KEY = "sk-your-deep-key"
+GROK_PROVIDER_DEEP_ENDPOINT = "chat/completions"
+GROK_PROVIDER_DEEP_MODEL = "grok-4.3-high"
+
+# 默认搜索模式；auto 会根据问题复杂度和 extra_sources 做保守路由
+GROK_SEARCH_MODE = "fast"
+
+# 默认 false：缺少另一个 profile 时静默使用已配置 profile，不打扰用户
+GROK_STRICT_SEARCH_MODE = "false"
 ```
 
 <details> <summary>如果遇到 SSL / 证书验证错误</summary>
@@ -134,7 +161,10 @@ claude mcp add-json grok-search --scope user '{
     "grok-search"
   ],
   "env": {
-    "GUDA_API_KEY": "your-guda-api-key"
+    "GROK_PROVIDER_FAST_API_URL": "https://your-fast-provider.example/v1",
+    "GROK_PROVIDER_FAST_API_KEY": "your-fast-provider-key",
+    "GROK_PROVIDER_FAST_ENDPOINT": "chat/completions",
+    "GROK_PROVIDER_FAST_MODEL": "grok-4.20-fast"
   }
 }'
 </details> ```
@@ -143,15 +173,18 @@ claude mcp add-json grok-search --scope user '{
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `GUDA_API_KEY` | ❌ | - | GuDa API 密钥（配置后自动派生所有服务的 URL 和 Key） |
+| `GUDA_API_KEY` | ❌ | - | GuDa API 密钥（用于未显式配置的 Tavily / Firecrawl 派生值） |
 | `GUDA_BASE_URL` | ❌ | `https://code.guda.studio` | GuDa 服务基础地址 |
-| `GROK_API_URL` | ❌ | `{GUDA_BASE_URL}/grok/v1` | Grok API 地址（OpenAI 兼容格式），显式设置时覆盖 GuDa 派生值 |
-| `GROK_API_KEY` | ❌ | `{GUDA_API_KEY}` | Grok API 密钥，显式设置时覆盖 GuDa 派生值 |
-| `GROK_API_ENDPOINT` | ❌ | `chat/completions` | Grok 请求端点。可设为 `chat/completions` 或 `responses` |
-| `GROK_MODEL` | ❌ | `grok-4.20-fast` | 默认模型（设置后优先于 `~/.config/grok-search/config.json`） |
-| `GROK_MODEL_FAST` | ❌ | `{GROK_MODEL}` | `web_search search_mode=fast` 使用的模型 |
-| `GROK_MODEL_DEEP` | ❌ | `{GROK_MODEL}` | `web_search search_mode=deep` 使用的模型 |
+| `GROK_PROVIDER_FAST_API_URL` | ⚠️ | - | fast profile 的 OpenAI 兼容 API 地址 |
+| `GROK_PROVIDER_FAST_API_KEY` | ⚠️ | - | fast profile 的 API Key |
+| `GROK_PROVIDER_FAST_ENDPOINT` | ❌ | `chat/completions` | fast profile 请求端点，可设为 `chat/completions` 或 `responses` |
+| `GROK_PROVIDER_FAST_MODEL` | ⚠️ | - | fast profile 使用的 Grok 模型 |
+| `GROK_PROVIDER_DEEP_API_URL` | ⚠️ | - | deep profile 的 OpenAI 兼容 API 地址 |
+| `GROK_PROVIDER_DEEP_API_KEY` | ⚠️ | - | deep profile 的 API Key |
+| `GROK_PROVIDER_DEEP_ENDPOINT` | ❌ | `chat/completions` | deep profile 请求端点，可设为 `chat/completions` 或 `responses` |
+| `GROK_PROVIDER_DEEP_MODEL` | ⚠️ | - | deep profile 使用的 Grok 模型 |
 | `GROK_SEARCH_MODE` | ❌ | `fast` | 默认搜索模式。可设为 `fast`、`deep` 或 `auto` |
+| `GROK_STRICT_SEARCH_MODE` | ❌ | `false` | 是否严格要求请求的 profile 必须存在 |
 | `TAVILY_API_KEY` | ❌ | `{GUDA_API_KEY}` | Tavily API 密钥（用于 web_fetch / web_map） |
 | `TAVILY_API_URL` | ❌ | `{GUDA_BASE_URL}/tavily` | Tavily API 地址 |
 | `TAVILY_ENABLED` | ❌ | `true` | 是否启用 Tavily |
@@ -164,7 +197,7 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_RETRY_MULTIPLIER` | ❌ | `1` | 重试退避乘数 |
 | `GROK_RETRY_MAX_WAIT` | ❌ | `10` | 重试最大等待秒数 |
 
-> **注意**：配置了 `GUDA_API_KEY` 后，`GROK_API_URL`/`GROK_API_KEY`/`TAVILY_*`/`FIRECRAWL_*` 均为可选，系统自动从 `GUDA_BASE_URL` 派生。显式设置的独立变量优先级更高。
+> **注意**：至少配置一组完整的 `GROK_PROVIDER_FAST_*` 或 `GROK_PROVIDER_DEEP_*`，Grok 搜索即可运行。只配置一组 profile 时，所有搜索模式都会使用这组可用配置，且不会产生用户可见 warning。
 
 
 ### 验证安装
@@ -196,7 +229,6 @@ claude mcp list
 |------|------|------|--------|------|
 | `query` | string | ✅ | - | 搜索查询语句 |
 | `platform` | string | ❌ | `""` | 聚焦平台（如 `"Twitter"`, `"GitHub, Reddit"`） |
-| `model` | string | ❌ | `null` | 按次指定 Grok 模型 ID |
 | `search_mode` | string | ❌ | `""` | Grok 模型路由模式。空值使用 `GROK_SEARCH_MODE`；支持 `fast`、`deep`、`auto` |
 | `extra_sources` | int | ❌ | `1` | 额外补充信源数量（Tavily/Firecrawl，可为 0 关闭） |
 
@@ -207,10 +239,14 @@ claude mcp list
 - `content`: Grok 回答正文（已自动剥离信源）
 - `sources_count`: 已缓存的信源数量
 - `warnings`: 当 Grok 返回为空或不可用时给出诊断提示
+- `provider_profile_requested`: 本次任务请求的 Grok profile
+- `provider_profile_used`: 本次任务实际使用的 Grok profile
+- `provider_profile_reason`: 实际路由原因
 - `model_used`: 本次 Grok 搜索实际使用的模型
+- `endpoint_used`: 本次 Grok 搜索实际使用的 endpoint
 - `search_mode_effective`: 本次实际生效的搜索模式
 
-当 Grok 主搜索返回为空但 Tavily/Firecrawl 仍提供补充信源时，`content` 会以“注意：Grok 主搜索返回为空……”开头，并建议运行 `diagnose_grok_config` 检查 `GROK_API_URL`、`GROK_API_ENDPOINT` 与模型配置。
+当 Grok 主搜索返回为空但 Tavily/Firecrawl 仍提供补充信源时，`content` 会以“注意：Grok 主搜索返回为空……”开头，并建议运行 `diagnose_grok_config` 检查 Provider Profile 配置。
 
 ### `get_sources` — 获取信源
 
@@ -246,25 +282,25 @@ claude mcp list
 | `limit` | int | ❌ | `50` | 总链接处理数上限（1-500） |
 | `timeout` | int | ❌ | `150` | 超时秒数（10-150） |
 
-### `get_config_info` — 配置诊断
+### `get_config_info` — 配置信息
 
-无需参数。显示所有配置状态、测试 Grok API 连接、返回响应时间和可用模型列表（API Key 自动脱敏）。
+无需参数。显示当前配置摘要与 Provider Profile 状态（API Key 自动脱敏）。联网诊断请使用 `diagnose_grok_config`。
 
 ### `diagnose_grok_config` — Grok 连接诊断
 
-用于更深入排查 Grok 主搜索为空、endpoint 不兼容、模型不存在或 URL 缺少 `/v1` 的情况。该工具会测试 `/models`、`chat/completions` 和 `responses`，并返回推荐的 `GROK_API_URL` / `GROK_API_ENDPOINT` 设置。API Key 会自动脱敏。
+用于更深入排查 Grok 主搜索为空、endpoint 不兼容、模型不存在或 URL 缺少 `/v1` 的情况。该工具会按 Provider Profile 分组测试 `/models`、`chat/completions` 和 `responses`，并返回 profile 级建议。API Key 会自动脱敏。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `model` | string | ❌ | `""` | 按次指定用于探测的模型；空值使用 fast/default 模型 |
+| `profile` | string | ❌ | `""` | 指定 `fast` 或 `deep`；空值检测全部已填写 profile |
 
-### `switch_model` — 模型切换
+### `switch_model` — 已废弃
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `model` | string | ✅ | 模型 ID（如 `"grok-4-fast"`, `"grok-2-latest"`） |
+| `model` | string | ✅ | 已忽略。模型需配置到 `GROK_PROVIDER_FAST_MODEL` 或 `GROK_PROVIDER_DEEP_MODEL` |
 
-切换后配置持久化到 `~/.config/grok-search/config.json`，跨会话保持。
+Grok 模型现在绑定到 Provider Profile。该工具保留是为了给旧调用返回明确的废弃提示。
 
 ### `toggle_builtin_tools` — 工具路由控制
 
@@ -285,7 +321,14 @@ claude mcp list
 <summary>
 Q: 必须同时配置 Grok 和 Tavily 吗？
 </summary>
-A: 配置 `GUDA_API_KEY` 即可获得完整的 Grok + Tavily + Firecrawl 服务。如不使用 GuDa，Grok（`GROK_API_URL` + `GROK_API_KEY`）为必填，提供核心搜索能力。Tavily 和 Firecrawl 均为可选：配置 Tavily 后 `web_fetch` 优先使用 Tavily Extract，失败时降级到 Firecrawl Scrape；两者均未配置时 `web_fetch` 将返回配置错误提示。`web_map` 依赖 Tavily。
+A: Grok 至少需要一组完整的 Provider Profile（FAST 或 DEEP 任意一组）。Tavily 和 Firecrawl 均为可选：配置 Tavily 后 `web_fetch` 优先使用 Tavily Extract，失败时降级到 Firecrawl Scrape；两者均未配置时 `web_fetch` 将返回配置错误提示。`web_map` 依赖 Tavily。
+</details>
+
+<details>
+<summary>
+Q: 只配置 FAST 或只配置 DEEP 会不会每次都 warning？
+</summary>
+A: 不会。缺少另一个 profile 是正常状态，不是失败。默认 `GROK_STRICT_SEARCH_MODE=false` 时，MCP 会使用唯一可用的 profile，并只在结构化字段中记录实际路由。只有 API 失败、模型不存在、endpoint 不兼容、Grok 返回空等真实故障才会进入用户可见 warning。
 </details>
 
 <details>
@@ -299,7 +342,7 @@ A: 需要 OpenAI 兼容格式的 API 地址（支持 `/chat/completions` 和 `/m
 <summary>
 Q: 如何验证配置？
 </summary>
-A: 在 Claude 对话中说"显示 grok-search 配置信息"，将自动测试 API 连接并显示结果。
+A: 使用 `get_config_info` 查看脱敏配置摘要；使用 `diagnose_grok_config` 进行联网诊断，检查每个 Provider Profile 的 URL、Key、模型和 endpoint。
 </details>
 
 ## 许可证

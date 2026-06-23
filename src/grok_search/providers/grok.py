@@ -118,9 +118,10 @@ class _WaitWithRetryAfter(wait_base):
 
 
 class GrokSearchProvider(BaseSearchProvider):
-    def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast"):
+    def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast", endpoint: str = "chat/completions"):
         super().__init__(api_url, api_key)
         self.model = model
+        self.endpoint = endpoint
 
     def get_provider_name(self) -> str:
         return "Grok"
@@ -277,7 +278,7 @@ class GrokSearchProvider(BaseSearchProvider):
     async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
         """执行带重试机制的流式 HTTP 请求"""
         timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
-        endpoint = config.grok_api_endpoint
+        endpoint = self.endpoint or "chat/completions"
         request_payload = self._to_responses_payload(payload) if endpoint == "responses" else payload
 
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
